@@ -1,293 +1,321 @@
 """
-Fast heuristic solver for the "Gold Thief" / Traveling Thief-style problem.
-
-NOTE:
-- Kept filename/class name (FastGASolver) to minimize changes to the project structure.
-- Replaced the expensive all-pairs shortest paths + GA with a fast, deterministic heuristic
-  designed to run in << 1s even for n up to ~500.
-
-Core idea:
-- Start from the baseline (one city per trip).
-- Greedily merge small groups of nearby cities into the same trip only when it strictly
-  reduces total cost under the true edge-by-edge cost function.
-- Special-case alpha == 0 (no weight penalty): then do a single tour (TSP-like) using a
-  fast nearest-neighbor heuristic, because carrying gold is free.
+Fast Genetic Algorithm Solver for Traveling Thief Problem
+Based on proven strategies from successful implementations
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
-import math
-
+import random
+import numpy as np
 import networkx as nx
-
-
-@dataclass
-class _Trip:
-    cities: List[int]  # excludes base (0)
+from typing import List, Tuple
 
 
 class FastGASolver:
-    """
-    Drop-in replacement for the previous GA solver.
-    Exposes the same API: FastGASolver(problem).solve() -> route list.
-    """
-
     def __init__(self, problem):
         self.problem = problem
-        self.G = problem.graph
-        self.alpha = float(problem.alpha)
-        self.beta = float(problem.beta)
-        self.n = len(self.G.nodes)
-
-        # Precompute base shortest paths once (cheap: one Dijkstra)
-        self._base_paths: Dict[int, List[int]] = nx.single_source_dijkstra_path(self.G, 0, weight="dist")
-        self._base_dists: Dict[int, float] = nx.single_source_dijkstra_path_length(self.G, 0, weight="dist")
-
-        # Node positions for quick "nearest neighbor" candidate generation
-        self._pos = nx.get_node_attributes(self.G, "pos")
-        self._gold = {i: float(self.G.nodes[i]["gold"]) for i in self.G.nodes}
-
-        # Cache for a few Dijkstra results to avoid repeating (bounded by demand)
-        self._sp_path_cache: Dict[Tuple[int, int], List[int]] = {}
-
-    # --------------------------- Public API ---------------------------
-
-    def solve(self) -> List[Tuple[int, float]]:
-        if self.n <= 1:
-            return [(0, 0)]
-
-        # alpha == 0 => cost is purely distance; best is a single tour
-        if abs(self.alpha) < 1e-12:
-            tour = self._nearest_neighbor_tour()
-            return self._tour_to_route_single_trip(tour)
-
-        # Otherwise: greedy merge improvements over baseline
-        trips = self._baseline_trips()
-        trips = self._improve_by_pair_merges(trips, k_candidates=12)
-        trips = self._improve_by_triple_extension(trips, k_candidates=10)
-
-        return self._trips_to_route(trips)
-
-    # --------------------------- Baseline ---------------------------
-
-    def _baseline_trips(self) -> List[_Trip]:
-        # one city per trip
-        return [_Trip([i]) for i in range(1, self.n)]
-
-    # --------------------------- Cost helpers (true edge-by-edge) ---------------------------
-
-    def _shortest_path(self, u: int, v: int) -> List[int]:
-        key = (u, v)
-        if key in self._sp_path_cache:
-            return self._sp_path_cache[key]
-        # Use Dijkstra path (sparse graph, n<=500 ok for limited calls)
-        p = nx.dijkstra_path(self.G, u, v, weight="dist")
-        self._sp_path_cache[key] = p
-        return p
-
-    def _clean_route(self, route: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
-        # ensure start/end base and remove duplicate consecutive base markers
-        if not route or route[0] != (0, 0):
-            route = [(0, 0)] + route
-        if route[-1] != (0, 0):
-            route.append((0, 0))
-
-        cleaned = [route[0]]
-        for x in route[1:]:
-            if x == (0, 0) and cleaned[-1] == (0, 0):
-                continue
-            cleaned.append(x)
-        return cleaned
-
-    def _to_route_from_trips(self, trips: List[List[int]]) -> List[Tuple[int, float]]:
+        self.graph = problem.graph
+        self.alpha = problem.alpha
+        self.beta = problem.beta
+        self.n_cities = len(self.graph.nodes)
+        
+        # Precompute distances
+        self.dist_matrix = dict(nx.all_pairs_dijkstra_path_length(self.graph, weight='dist'))
+        self.paths = dict(nx.all_pairs_dijkstra_path(self.graph, weight='dist'))
+        
+        # Cache gold values
+        self.gold = np.array([self.graph.nodes[i]['gold'] for i in range(self.n_cities)])
+        
+        # Get cities list (excluding base)
+        self.cities = [i for i in range(1, self.n_cities)]
+        
+    def evaluate_tour(self, tour: List[int]) -> float:
         """
-        trips: list of lists of city IDs (each city > 0)
-        returns: [(0,0), (c,g), ..., (0,0), ...]
+        Evaluate total cost of a tour with optimal split strategy
         """
-        route: List[Tuple[int, float]] = [(0, 0)]
-        for trip in trips:
-            for c in trip:
-                route.append((int(c), float(self._gold[c])))
-            route.append((0, 0))
-        return self._clean_route(route)
-
-    def _path_cost(self, path: List[int], carried_weight: float) -> float:
-        # Sum per edge using problem.cost([a,b], carried_weight)
-        c = 0.0
-        for a, b in zip(path, path[1:]):
-            c += self.problem.cost([a, b], carried_weight)
-        return c
-
-    def _trip_cost(self, trip: _Trip) -> float:
-        """
-        Cost of: base -> city1 -> city2 -> ... -> base,
-        collecting all gold in each city upon arrival.
-        """
-        w = 0.0
-        total = 0.0
-        prev = 0
-        for city in trip.cities:
-            path = self._base_paths[city] if prev == 0 else self._shortest_path(prev, city)
-            total += self._path_cost(path, w)
-            w += self._gold[city]
-            prev = city
-        # return to base
-        if prev != 0:
-            back_path = list(reversed(self._base_paths[prev]))  # undirected graph
-            total += self._path_cost(back_path, w)
-        return total
-
-    # --------------------------- Improvements ---------------------------
-
-    def _euclid(self, a: int, b: int) -> float:
-        ax, ay = self._pos[a]
-        bx, by = self._pos[b]
-        dx = ax - bx
-        dy = ay - by
-        return math.hypot(dx, dy)
-
-    def _nearest_candidates(self, city: int, remaining: set, k: int) -> List[int]:
-        # pick k nearest by euclidean among remaining
-        # (fast enough for n<=500)
-        cand = [(self._euclid(city, j), j) for j in remaining if j != city]
-        cand.sort(key=lambda x: x[0])
-        return [j for _, j in cand[:k]]
-
-    def _improve_by_pair_merges(self, trips: List[_Trip], k_candidates: int = 12) -> List[_Trip]:
-        """
-        Try to merge single-city trips into 2-city trips when beneficial.
-        """
-        remaining = set(range(1, self.n))
-        trips_out: List[_Trip] = []
-        used = set()
-
-        # For reproducibility & speed: process cities in ascending base distance (closer first)
-        order = sorted(list(remaining), key=lambda c: self._base_dists.get(c, 1e9))
-
-        for a in order:
-            if a in used:
-                continue
-
-            used.add(a)
-            best_b = None
-            best_delta = 0.0
-
-            # candidates among not-used
-            pool = remaining - used
-            for b in self._nearest_candidates(a, pool, k_candidates):
-                if b in used:
-                    continue
-                # baseline: two separate trips
-                cost_sep = self._trip_cost(_Trip([a])) + self._trip_cost(_Trip([b]))
-                # merged: try both orders and pick best
-                cost_ab = min(self._trip_cost(_Trip([a, b])), self._trip_cost(_Trip([b, a])))
-                delta = cost_sep - cost_ab
-                if delta > best_delta + 1e-9:
-                    best_delta = delta
-                    best_b = b
-
-            if best_b is not None:
-                used.add(best_b)
-                trips_out.append(_Trip([a, best_b]))
-            else:
-                trips_out.append(_Trip([a]))
-
-        return trips_out
-
-    def _improve_by_triple_extension(self, trips: List[_Trip], k_candidates: int = 10) -> List[_Trip]:
-        """
-        Try to extend some 2-city trips to 3 cities if beneficial.
-        Keep this conservative for speed and robustness.
-        """
-        remaining = set(range(1, self.n))
-        in_trip = set()
-        for t in trips:
-            for c in t.cities:
-                in_trip.add(c)
-        # already covers all, but we use it to avoid mistakes
-        assert in_trip == remaining
-
-        trips_out: List[_Trip] = []
-
-        singles = [tr for tr in trips if len(tr.cities) == 1]
-        single_set = set(tr.cities[0] for tr in singles)
-
-        for t in trips:
-            if len(t.cities) != 2:
-                trips_out.append(t)
-                continue
-
-            a, b = t.cities
-            best_c = None
-            best_gain = 0.0
-
-            candidates = set(
-                self._nearest_candidates(a, single_set, k_candidates)
-                + self._nearest_candidates(b, single_set, k_candidates)
-            )
-            for c in candidates:
-                if c in (a, b):
-                    continue
-                old = self._trip_cost(t) + self._trip_cost(_Trip([c]))
-                perms = ([a, b, c], [a, c, b], [b, a, c], [b, c, a], [c, a, b], [c, b, a])
-                new = min(self._trip_cost(_Trip(list(p))) for p in perms)
-                gain = old - new
-                if gain > best_gain + 1e-9:
-                    best_gain = gain
-                    best_c = c
-
-            if best_c is not None and best_gain > 1e-6:
-                trips_out.append(_Trip([a, b, best_c]))
-                single_set.discard(best_c)
-            else:
-                trips_out.append(t)
-
-        # Remove singles that were absorbed
-        final_trips: List[_Trip] = []
-        absorbed = set()
-        for t in trips_out:
-            if len(t.cities) == 3:
-                absorbed.add(t.cities[2])  # the one we added (ok for this heuristic)
-        for t in trips_out:
-            if len(t.cities) == 1 and t.cities[0] in absorbed:
-                continue
-            final_trips.append(t)
-        return final_trips
-
-    # --------------------------- Route formatting ---------------------------
-
-    def _tour_to_route_single_trip(self, tour: List[int]) -> List[Tuple[int, float]]:
-        # IMPORTANT: start and end at base; no unload until final return
-        route: List[Tuple[int, float]] = [(0, 0)]
+        if not tour:
+            return float('inf')
+            
+        # For beta > 1: hub-spoke is better (individual trips)
+        if self.beta > 1.0:
+            return self._eval_hub_spoke(tour)
+        
+        # For beta <= 1: accumulation strategy with smart splitting
+        return self._eval_with_split(tour)
+    
+    def _eval_hub_spoke(self, tour: List[int]) -> float:
+        """Hub-spoke: go to each city and return immediately"""
+        total_cost = 0
         for city in tour:
-            route.append((city, self._gold[city]))
-        route.append((0, 0))
-        return self._clean_route(route)
-
-    def _trips_to_route(self, trips: List[_Trip]) -> List[Tuple[int, float]]:
-        route: List[Tuple[int, float]] = [(0, 0)]
-        for t in trips:
-            for city in t.cities:
-                route.append((city, self._gold[city]))
-            route.append((0, 0))
-        return self._clean_route(route)
-
-    # --------------------------- alpha==0 tour builder ---------------------------
-
-    def _nearest_neighbor_tour(self) -> List[int]:
+            gold = self.gold[city]
+            # Go there (no weight)
+            try:
+                path_there = self.paths[0][city]
+                cost_there = sum(self.problem.cost([path_there[i], path_there[i+1]], 0) 
+                               for i in range(len(path_there)-1))
+                
+                # Return (with gold)
+                path_back = self.paths[city][0]
+                cost_back = sum(self.problem.cost([path_back[i], path_back[i+1]], gold) 
+                              for i in range(len(path_back)-1))
+                
+                total_cost += cost_there + cost_back
+            except:
+                return float('inf')
+        
+        return total_cost
+    
+    def _eval_with_split(self, tour: List[int]) -> float:
         """
-        Very fast nearest-neighbor tour based on Euclidean distance (not shortest-path),
-        used only when alpha==0 (weight irrelevant). We still return a *feasible*
-        route because feasibility is handled by evaluator via graph shortest paths.
+        Evaluate tour with dynamic splitting for beta <= 1
+        Uses dynamic programming to find optimal split points
         """
-        unvisited = set(range(1, self.n))
-        current = 0
-        tour: List[int] = []
-        while unvisited:
-            nxt = min(unvisited, key=lambda j: self._euclid(current if current != 0 else 0, j))
-            unvisited.remove(nxt)
-            tour.append(nxt)
-            current = nxt
+        n = len(tour)
+        if n == 0:
+            return 0
+        
+        # DP array: dp[i] = min cost to collect gold from cities tour[0:i]
+        dp = [float('inf')] * (n + 1)
+        dp[0] = 0
+        
+        # Try all possible last trip lengths
+        max_trip_len = min(n, 15)  # Limit trip length for efficiency
+        
+        for i in range(1, n + 1):
+            for trip_len in range(1, min(i, max_trip_len) + 1):
+                start_idx = i - trip_len
+                trip_cities = tour[start_idx:i]
+                
+                trip_cost = self._calc_trip_cost(trip_cities)
+                dp[i] = min(dp[i], dp[start_idx] + trip_cost)
+        
+        return dp[n]
+    
+    def _calc_trip_cost(self, cities: List[int]) -> float:
+        """Calculate cost of a single trip: 0 -> cities -> 0"""
+        if not cities:
+            return 0
+        
+        total_cost = 0
+        current_weight = 0
+        current_pos = 0
+        
+        # Visit each city
+        for city in cities:
+            try:
+                path = self.paths[current_pos][city]
+                for i in range(len(path) - 1):
+                    total_cost += self.problem.cost([path[i], path[i+1]], current_weight)
+                
+                current_weight += self.gold[city]
+                current_pos = city
+            except:
+                return float('inf')
+        
+        # Return to base
+        try:
+            path = self.paths[current_pos][0]
+            for i in range(len(path) - 1):
+                total_cost += self.problem.cost([path[i], path[i+1]], current_weight)
+        except:
+            return float('inf')
+        
+        return total_cost
+    
+    def nearest_neighbor(self, start=None) -> List[int]:
+        """Greedy nearest neighbor heuristic"""
+        if start is None:
+            start = random.choice(self.cities)
+        
+        tour = [start]
+        remaining = set(self.cities) - {start}
+        current = start
+        
+        while remaining:
+            nearest = min(remaining, key=lambda c: self.dist_matrix[current][c])
+            tour.append(nearest)
+            remaining.remove(nearest)
+            current = nearest
+        
         return tour
+    
+    def order_crossover(self, parent1: List[int], parent2: List[int]) -> List[int]:
+        """Order crossover (OX)"""
+        size = len(parent1)
+        start, end = sorted(random.sample(range(size), 2))
+        
+        child = [None] * size
+        child[start:end] = parent1[start:end]
+        
+        pos = end
+        for city in parent2[end:] + parent2[:end]:
+            if city not in child:
+                if pos >= size:
+                    pos = 0
+                child[pos] = city
+                pos += 1
+        
+        return child
+    
+    def mutate(self, tour: List[int]) -> List[int]:
+        """Mutation: swap or reverse segment"""
+        tour = tour.copy()
+        
+        if random.random() < 0.5:
+            # Swap mutation
+            i, j = random.sample(range(len(tour)), 2)
+            tour[i], tour[j] = tour[j], tour[i]
+        else:
+            # Reverse segment
+            i, j = sorted(random.sample(range(len(tour)), 2))
+            tour[i:j+1] = reversed(tour[i:j+1])
+        
+        return tour
+    
+    def local_search_2opt(self, tour: List[int], max_iter=50) -> List[int]:
+        """2-opt local search"""
+        improved = True
+        iterations = 0
+        best_tour = tour.copy()
+        best_cost = self.evaluate_tour(best_tour)
+        
+        while improved and iterations < max_iter:
+            improved = False
+            iterations += 1
+            
+            for i in range(len(best_tour) - 1):
+                for j in range(i + 2, len(best_tour)):
+                    new_tour = best_tour.copy()
+                    new_tour[i+1:j+1] = reversed(new_tour[i+1:j+1])
+                    
+                    new_cost = self.evaluate_tour(new_tour)
+                    if new_cost < best_cost:
+                        best_tour = new_tour
+                        best_cost = new_cost
+                        improved = True
+                        break
+                
+                if improved:
+                    break
+        
+        return best_tour
+    
+    def solve(self) -> List[Tuple[int, float]]:
+        """Main GA solver"""
+        print(f"Solving with GA (n={self.n_cities}, α={self.alpha}, β={self.beta})...")
+        
+        # Parameters
+        pop_size = min(100, self.n_cities * 2)
+        generations = min(200, self.n_cities * 3)
+        elite_size = max(5, pop_size // 10)
+        mutation_rate = 0.3
+        
+        # Initialize population
+        population = []
+        
+        # 50% nearest neighbor from different starts
+        for _ in range(pop_size // 2):
+            population.append(self.nearest_neighbor())
+        
+        # 50% random
+        for _ in range(pop_size - len(population)):
+            tour = self.cities.copy()
+            random.shuffle(tour)
+            population.append(tour)
+        
+        # Evaluate
+        fitness = [self.evaluate_tour(ind) for ind in population]
+        best_idx = np.argmin(fitness)
+        best_solution = population[best_idx]
+        best_cost = fitness[best_idx]
+        
+        print(f"Initial best cost: {best_cost:.2f}")
+        
+        # Evolution
+        for gen in range(generations):
+            new_population = []
+            
+            # Elitism
+            sorted_idx = np.argsort(fitness)
+            for i in range(elite_size):
+                new_population.append(population[sorted_idx[i]])
+            
+            # Generate offspring
+            while len(new_population) < pop_size:
+                # Tournament selection
+                p1 = population[min(random.sample(range(pop_size), 3), key=lambda i: fitness[i])]
+                p2 = population[min(random.sample(range(pop_size), 3), key=lambda i: fitness[i])]
+                
+                # Crossover
+                child = self.order_crossover(p1, p2)
+                
+                # Mutation
+                if random.random() < mutation_rate:
+                    child = self.mutate(child)
+                
+                new_population.append(child)
+            
+            # Local search on best
+            if gen % 10 == 0:
+                new_population[0] = self.local_search_2opt(new_population[0], max_iter=30)
+            
+            population = new_population
+            fitness = [self.evaluate_tour(ind) for ind in population]
+            
+            curr_best_idx = np.argmin(fitness)
+            if fitness[curr_best_idx] < best_cost:
+                best_cost = fitness[curr_best_idx]
+                best_solution = population[curr_best_idx]
+                print(f"Gen {gen}: New best = {best_cost:.2f}")
+        
+        # Final 2-opt
+        print("Final refinement...")
+        best_solution = self.local_search_2opt(best_solution, max_iter=100)
+        
+        # Convert to required format
+        return self._convert_to_path(best_solution)
+    
+    def _convert_to_path(self, tour: List[int]) -> List[Tuple[int, float]]:
+        """Convert tour to required path format"""
+        if self.beta > 1.0:
+            # Hub-spoke: each city individually
+            path = []
+            for city in tour:
+                path.append((city, self.gold[city]))
+                path.append((0, 0))
+            return path
+        
+        # For beta <= 1: use optimal splitting
+        n = len(tour)
+        dp = [float('inf')] * (n + 1)
+        parent = [-1] * (n + 1)
+        dp[0] = 0
+        
+        max_trip_len = min(n, 15)
+        
+        for i in range(1, n + 1):
+            for trip_len in range(1, min(i, max_trip_len) + 1):
+                start_idx = i - trip_len
+                trip_cities = tour[start_idx:i]
+                trip_cost = self._calc_trip_cost(trip_cities)
+                
+                if dp[start_idx] + trip_cost < dp[i]:
+                    dp[i] = dp[start_idx] + trip_cost
+                    parent[i] = start_idx
+        
+        # Reconstruct trips
+        trips = []
+        i = n
+        while i > 0:
+            start = parent[i]
+            trips.append(tour[start:i])
+            i = start
+        
+        trips.reverse()
+        
+        # Build path
+        path = []
+        for trip in trips:
+            for city in trip:
+                path.append((city, self.gold[city]))
+            path.append((0, 0))
+        
+        return path
