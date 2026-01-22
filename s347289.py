@@ -5,8 +5,8 @@ Student ID: s347289
 Requirements satisfied:
 - Provides a `solution(p)` function returning:
   [(0, 0), (c1, g1), (c2, g2), ..., (cN, gN), (0, 0)]
-- Prints (0,0) whenever the traveler returns to base to unload gold.
-- Fast runtime (<< 1 second for typical sizes).
+- When executed as a script, prints parameters and the solution path.
+- Fast runtime (designed to be << 1s for typical sizes).
 """
 
 from __future__ import annotations
@@ -20,16 +20,21 @@ from src.fast_ga import FastGASolver
 
 def solution(p: Problem) -> List[Tuple[int, float]]:
     """
-    Compute a route that visits all cities, collects all gold,
-    and unloads at the base (0) whenever needed.
+    Compute a route that visits all cities, collects all their gold, and returns to base (0)
+    one or more times.
 
-    Returned format:
-    [(0,0), (c1,g1), ..., (0,0), (cK,gK), ..., (0,0)]
+    Returned route format:
+        [(0, 0), (c1, g1), (c2, g2), ..., (cN, gN), (0, 0)]
+
+    Notes:
+    - City 0 is the base.
+    - Whenever (0, 0) appears, the carried gold is unloaded.
+    - For each city i>0, the returned gold amount equals the full gold available at that city.
     """
     solver = FastGASolver(p)
     route = solver.solve()
 
-    # ---- STRICT FORMAT ENFORCEMENT ----
+    # --- STRICT FORMAT ENFORCEMENT ---
 
     # ensure start at base
     if not route or route[0] != (0, 0):
@@ -39,14 +44,7 @@ def solution(p: Problem) -> List[Tuple[int, float]]:
     if route[-1] != (0, 0):
         route.append((0, 0))
 
-    # remove duplicate consecutive (0,0)
-    cleaned = [route[0]]
-    for item in route[1:]:
-        if item == (0, 0) and cleaned[-1] == (0, 0):
-            continue
-        cleaned.append(item)
-
-    return cleaned
+    return route
 
 
 def _main() -> None:
@@ -68,10 +66,11 @@ def _main() -> None:
 
     route = solution(p)
 
-    print(f"num_cities={p.n}, alpha={p.alpha}, beta={p.beta}, density={p.density}")
+    # REQUIRED OUTPUT FORMAT
+    print(f"num_cities={p.num_cities} \nalpha={p.alpha} \nbeta={p.beta} \ndensity={p.density} \n")
     print("Solution path :")
     print(route)
 
 
 if __name__ == "__main__":
-    _main()
+    _main() 

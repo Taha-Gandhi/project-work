@@ -17,7 +17,7 @@ Core idea:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 import math
 
 import networkx as nx
@@ -86,6 +86,32 @@ class FastGASolver:
         p = nx.dijkstra_path(self.G, u, v, weight="dist")
         self._sp_path_cache[key] = p
         return p
+
+    def _clean_route(self, route: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
+        # ensure start/end base and remove duplicate consecutive base markers
+        if not route or route[0] != (0, 0):
+            route = [(0, 0)] + route
+        if route[-1] != (0, 0):
+            route.append((0, 0))
+
+        cleaned = [route[0]]
+        for x in route[1:]:
+            if x == (0, 0) and cleaned[-1] == (0, 0):
+                continue
+            cleaned.append(x)
+        return cleaned
+
+    def _to_route_from_trips(self, trips: List[List[int]]) -> List[Tuple[int, float]]:
+        """
+        trips: list of lists of city IDs (each city > 0)
+        returns: [(0,0), (c,g), ..., (0,0), ...]
+        """
+        route: List[Tuple[int, float]] = [(0, 0)]
+        for trip in trips:
+            for c in trip:
+                route.append((int(c), float(self._gold[c])))
+            route.append((0, 0))
+        return self._clean_route(route)
 
     def _path_cost(self, path: List[int], carried_weight: float) -> float:
         # Sum per edge using problem.cost([a,b], carried_weight)
@@ -184,15 +210,6 @@ class FastGASolver:
         assert in_trip == remaining
 
         trips_out: List[_Trip] = []
-        unused = set(remaining)
-
-        for t in trips:
-            for c in t.cities:
-                if c in unused:
-                    unused.remove(c)
-
-        # Actually unused should be empty; extension works by taking from other trips.
-        # We'll only attempt "steal one city" from a single-city trip into a 2-city trip if good.
 
         singles = [tr for tr in trips if len(tr.cities) == 1]
         single_set = set(tr.cities[0] for tr in singles)
@@ -203,18 +220,17 @@ class FastGASolver:
                 continue
 
             a, b = t.cities
-            # try taking a nearby single-city 'c' and make a 3-city trip, leaving that single removed
             best_c = None
             best_gain = 0.0
 
-            # candidate singles near either a or b
-            candidates = set(self._nearest_candidates(a, single_set, k_candidates) + self._nearest_candidates(b, single_set, k_candidates))
+            candidates = set(
+                self._nearest_candidates(a, single_set, k_candidates)
+                + self._nearest_candidates(b, single_set, k_candidates)
+            )
             for c in candidates:
                 if c in (a, b):
                     continue
-                # old cost: trip(a,b) + trip(c)
                 old = self._trip_cost(t) + self._trip_cost(_Trip([c]))
-                # new: best permutation of (a,b,c)
                 perms = ([a, b, c], [a, c, b], [b, a, c], [b, c, a], [c, a, b], [c, b, a])
                 new = min(self._trip_cost(_Trip(list(p))) for p in perms)
                 gain = old - new
@@ -224,7 +240,6 @@ class FastGASolver:
 
             if best_c is not None and best_gain > 1e-6:
                 trips_out.append(_Trip([a, b, best_c]))
-                # Remove best_c by filtering it out later
                 single_set.discard(best_c)
             else:
                 trips_out.append(t)
@@ -234,7 +249,7 @@ class FastGASolver:
         absorbed = set()
         for t in trips_out:
             if len(t.cities) == 3:
-                absorbed.add(t.cities[2])  # the one we added (not perfect but ok)
+                absorbed.add(t.cities[2])  # the one we added (ok for this heuristic)
         for t in trips_out:
             if len(t.cities) == 1 and t.cities[0] in absorbed:
                 continue
@@ -244,22 +259,20 @@ class FastGASolver:
     # --------------------------- Route formatting ---------------------------
 
     def _tour_to_route_single_trip(self, tour: List[int]) -> List[Tuple[int, float]]:
-        route: List[Tuple[int, float]] = []
+        # IMPORTANT: start and end at base; no unload until final return
+        route: List[Tuple[int, float]] = [(0, 0)]
         for city in tour:
             route.append((city, self._gold[city]))
         route.append((0, 0))
-        return route
+        return self._clean_route(route)
 
     def _trips_to_route(self, trips: List[_Trip]) -> List[Tuple[int, float]]:
-        route: List[Tuple[int, float]] = []
+        route: List[Tuple[int, float]] = [(0, 0)]
         for t in trips:
             for city in t.cities:
                 route.append((city, self._gold[city]))
             route.append((0, 0))
-        # Ensure ends at base
-        if not route or route[-1] != (0, 0):
-            route.append((0, 0))
-        return route
+        return self._clean_route(route)
 
     # --------------------------- alpha==0 tour builder ---------------------------
 
@@ -273,7 +286,6 @@ class FastGASolver:
         current = 0
         tour: List[int] = []
         while unvisited:
-            # choose nearest euclidean
             nxt = min(unvisited, key=lambda j: self._euclid(current if current != 0 else 0, j))
             unvisited.remove(nxt)
             tour.append(nxt)
