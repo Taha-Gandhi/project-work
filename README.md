@@ -1,19 +1,5 @@
 # Traveling Thief Problem - Optimized Solution
 
-## Performance Summary
-
-**IMPROVEMENT: 0.10%** over baseline
-
-| Metric | Value |
-|--------|-------|
-| Net Profit (Ours) | 4698.97 |
-| Baseline Profit | 4694.20 |
-| **Improvement** | **0.10%** |
-| Total Gold Collected | 9739.20 |
-| Travel Cost | 5040.23 |
-| Cities Visited | 19 |
-| Number of Trips | 12 |
-
 ## Strategy
 
 This solution uses an **Adaptive Genetic Algorithm** that selects the optimal strategy based on problem parameters:
@@ -47,13 +33,7 @@ This solution uses an **Adaptive Genetic Algorithm** that selects the optimal st
    - Hub-spoke cost calculation for β > 1
    - DP-based optimal splitting for β ≤ 1
 
-## Route Details
-
-Total route length: 31 steps
-Cities visited: 19
-Trips made: 12
-
-## Files
+## Main Files
 
 - `s123456.py` - Main solution file
 - `Problem.py` - Problem definition
@@ -64,12 +44,7 @@ Trips made: 12
 ## Usage
 
 ```python
-from Problem import Problem
-from s123456 import solution
-
-p = Problem(num_cities=20, alpha=1.0, beta=1.0)
-path = solution(p)
+python s347289.py --n 50 --alpha 1 --beta 0.5 --density 0.5 --seed 42
 ```
 
----
-*Solution optimized using proven strategies from successful implementations*
+Author : Taha Yusuf Gandhi
